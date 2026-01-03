@@ -1,0 +1,406 @@
+
+
+```{r warning = FALSE, message = FALSE}
+library(conflicted)
+library(tidyverse)
+library(RSQLite)
+library(scales)
+library(lmtest)
+library(broom)
+library(sandwich)
+library(rlang)
+conflicts_prefer(dplyr::filter)
+```
+
+
+```{r warning = FALSE, message = FALSE}
+firm_panel <- dbConnect(SQLite(), "path/to/local_database.sqlite",extended_types = TRUE)
+# CRSP mohtlyh data
+crsp_monthly <- tbl(firm_panel, "crsp_monthly") |>
+  select(permno, gvkey, month, ret_excess, mktcap) |> 
+  collect()
+compustat <- tbl(firm_panel, "compustat") |>
+  select(datadate, gvkey, be) |> 
+  collect()
+beta <- tbl(firm_panel, "beta") |> 
+  select(month, permno, beta_monthly) |>
+  collect()
+characteristics <- compustat |> 
+  mutate(month = floor_date(ymd(datadate), "month")) |>
+  left_join(crsp_monthly, by = c("gvkey", "month")) |> 
+  left_join(beta, by = c("permno", "month")) |> 
+  transmute(gvkey,
+    bm = be / mktcap, 
+    log_mktcap = log(mktcap), 
+    beta = beta_monthly, 
+    sorting_date = month %m+% months(6) 
+  )
+# below is the final data set
+data_fama_macbeth <- crsp_monthly |>
+  left_join(characteristics, by = c("gvkey", "month" = "sorting_date")) |>
+  group_by(permno) |>
+  arrange(month) |>
+  fill(c(beta, bm, log_mktcap), .direction = "down") |>
+  ungroup() |>
+  left_join(crsp_monthly |>
+    select(permno, month, ret_excess_lead = ret_excess) |>
+    mutate(month = month %m-% months(1)),
+  by = c("permno", "month")
+  ) |>
+  select(permno, month, ret_excess_lead, beta, log_mktcap, bm) |>
+  drop_na()
+```
+
+
+
+```{r warning = FALSE, message = FALSE}
+# risk premiums is R(t)^B - runs the Fama-Macbeth regression - estimates beta and then runs cross-sectionals
+risk_premiums <- data_fama_macbeth |>
+  nest(data = c(ret_excess_lead, beta, log_mktcap, bm, permno)) |> 
+  mutate(estimates = map(
+    data,
+    ~ tidy(lm(ret_excess_lead ~ beta + log_mktcap + bm, data = .x)) 
+  )) |>
+  unnest(estimates)
+print (risk_premiums)
+```
+
+
+```{r warning = FALSE, message = FALSE}
+data_fama_macbeth |>
+  nest(data = c(ret_excess_lead, beta, log_mktcap, bm, permno)) |> 
+  mutate(estimates = map(
+    data,
+    ~ glance(lm(ret_excess_lead ~ beta + log_mktcap + bm, data = .x)) 
+  )) |>
+  unnest(estimates) |>
+  select(r.squared,nobs) |> 
+  summary()
+```
+
+
+```{r warning = FALSE, message = FALSE}
+risk_premiums %>%
+  group_by(term) %>%
+  summarise(
+    avg_coefficient = mean(estimate),
+    std_error = sd(estimate)/sqrt(n())
+  )
+```
+
+
+
+
+```{r warning = FALSE, message = FALSE}
+# risk premoum beta
+Rt_beta <- risk_premiums |>
+  filter(term == "beta") |>
+  select(month, Rt_beta = estimate)
+
+# risk premium mc
+Rt_MC <- risk_premiums |>
+  filter(term == "log_mktcap") |>
+  select(month, Rt_MC = estimate)
+
+# risk premium bm
+Rt_BM <- risk_premiums |>
+  filter(term == "bm") |>
+  select(month, Rt_BM = estimate)
+```
+
+
+
+```{r}
+# print(Rt_beta)
+# print(Rt_MC)
+# print(Rt_BM)
+```
+
+```{r warning = FALSE, message = FALSE}
+factors_ff3_monthly <- tbl(firm_panel, "factors_ff3_monthly") |>
+  select(month, mkt_excess, smb, hml) |>
+  collect()
+
+# risk factor
+factors_from_fm <- Rt_beta |>
+  left_join(Rt_MC, by = "month") |>
+  left_join(Rt_BM, by = "month")
+
+stock_data <- crsp_monthly |>
+  left_join(factors_ff3_monthly, by = "month") |>
+  left_join(factors_from_fm, by = "month") |>
+  drop_na()
+
+stock_counts <- stock_data |>
+  group_by(permno) |>
+  summarise(
+    n_obs = n(),
+    n_na = sum(is.na(ret_excess) | is.na(mkt_excess) | is.na(smb) | 
+               is.na(hml) | is.na(Rt_beta) | is.na(Rt_MC) | is.na(Rt_BM))
+  )
+
+valid_stocks <- stock_counts |>
+  filter(n_obs >= 12, n_na == 0) |>
+  pull(permno)
+
+stock_data_filtered <- stock_data |>
+  filter(permno %in% valid_stocks)
+
+# print("Data Quality Summary:")
+# print(paste("Total number of stocks before filtering:", n_distinct(stock_data$permno)))
+# print(paste("Number of stocks after filtering:", length(valid_stocks)))
+
+# FF3 regression for each valid stock
+ff3_stock_regressions <- stock_data_filtered |>
+  group_by(permno) |>
+  nest() |>
+  mutate(
+    # FF3 model
+    ff3_model = map(data, function(df) {
+      tryCatch({
+        model <- lm(ret_excess ~ mkt_excess + smb + hml, data = df)
+        if(any(is.na(coef(model)))) return(NULL)
+        model
+      }, error = function(e) NULL)
+    }),
+    ff3_results = map(ff3_model, possibly(tidy, otherwise = NULL)),
+    ff3_fit = map(ff3_model, possibly(glance, otherwise = NULL)),
+    
+    # risk premium model using risk premium
+    risk_premium_model = map(data, function(df) {
+      tryCatch({
+        model <- lm(ret_excess ~ Rt_beta + Rt_MC + Rt_BM, data = df)
+        if(any(is.na(coef(model)))) return(NULL)
+        model
+      }, error = function(e) NULL)
+    }),
+    risk_premium_results = map(risk_premium_model, possibly(tidy, otherwise = NULL)),
+    risk_premium_fit = map(risk_premium_model, possibly(glance, otherwise = NULL))
+  )
+
+# coeff result
+ff3_stock_coefficients <- ff3_stock_regressions |>
+  unnest(ff3_results) |>
+  filter(!is.null(estimate)) |>
+  select(permno, term, estimate, std.error, statistic, p.value) |>
+  mutate(model = "FF3")
+
+risk_premium_stock_coefficients <- ff3_stock_regressions |>
+  unnest(risk_premium_results) |>
+  filter(!is.null(estimate)) |>
+  select(permno, term, estimate, std.error, statistic, p.value) |>
+  mutate(model = "Risk Premium")
+
+all_stock_coefficients <- bind_rows(ff3_stock_coefficients, risk_premium_stock_coefficients)
+
+# summary
+ff3_stock_fit <- ff3_stock_regressions |>
+  unnest(ff3_fit) |>
+  filter(!is.null(r.squared)) |>
+  select(permno, r.squared, adj.r.squared) |>
+  mutate(model = "FF3")
+
+risk_premium_stock_fit <- ff3_stock_regressions |>
+  unnest(risk_premium_fit) |>
+  filter(!is.null(r.squared)) |>
+  select(permno, r.squared, adj.r.squared) |>
+  mutate(model = "Risk Premium")
+
+all_stock_fits <- bind_rows(ff3_stock_fit, risk_premium_stock_fit)
+
+fit_summary <- all_stock_fits |>
+  group_by(model) |>
+  summarise(
+    mean_r2 = mean(r.squared),
+    median_r2 = median(r.squared),
+    min_r2 = min(r.squared),
+    max_r2 = max(r.squared),
+    n_stocks = n()
+  )
+
+# print("\nModel Fit Summary Statistics:")
+print(fit_summary)
+```
+
+
+
+```{r warning = FALSE, message = FALSE}
+library(fixest)
+
+# panel regression and 2-way clustering
+panel_reg <- feols(
+  ret_excess_lead ~ beta + log_mktcap + bm, 
+  data = data_fama_macbeth,
+  cluster = c("permno", "month") 
+)
+
+# FM summary
+fm_results <- risk_premiums %>%
+  group_by(term) %>%
+  summarise(
+    fm_coefficient = sprintf("%.10f", mean(estimate)), 
+    fm_se = sprintf("%.10f", sd(estimate)/sqrt(n())) 
+  )
+
+# panel regression results
+panel_results <- broom::tidy(panel_reg) %>% 
+  select(term, estimate, std.error) %>%
+  rename(
+    panel_coefficient = estimate,
+    panel_se = std.error) %>%
+  mutate(
+    panel_coefficient = sprintf("%.10f", panel_coefficient),
+    panel_se = sprintf("%.10f", panel_se) 
+  )
+
+comparison <- panel_results %>%
+  inner_join(fm_results, by = "term")
+
+# t-statistics to check results
+# comparison_with_stats <- panel_results %>%
+#   inner_join(fm_results, by = "term") %>%
+#   mutate(
+#     panel_t = as.numeric(panel_coefficient)/as.numeric(panel_se), 
+#     fm_t = as.numeric(fm_coefficient)/as.numeric(fm_se), 
+#     panel_p = 2 * (1 - pnorm(abs(panel_t))),
+#     fm_p = 2 * (1 - pnorm(abs(fm_t))) 
+#   ) %>%
+#   mutate(across(c(panel_t, fm_t, panel_p, fm_p), ~sprintf("%.10f", .)))
+
+# print("Panel vs Fama-MacBeth Comparison (consistent decimal format):")
+print(comparison)
+
+# print("\nResults with t-statistics:")
+# print(comparison_with_stats)
+```
+
+
+
+```{r warning = FALSE, message = FALSE}
+firm_panel <- dbConnect(SQLite(), "path/to/local_database.sqlite",extended_types = TRUE)
+
+# CRSP data and drop na
+crsp_monthly <- tbl(firm_panel, "crsp_monthly") |>
+  select(
+    permno, gvkey, month, ret_excess,
+    mktcap, mktcap_lag, exchange
+  ) |>
+  collect()
+# FF3 data and drop na
+factors_ff3_monthly <- tbl(firm_panel, "factors_ff3_monthly") |>
+  select(month, mkt_excess, smb, hml) |>
+  collect()
+# book eq from compustat
+book_equity <- tbl(firm_panel, "compustat") |>
+  select(gvkey, datadate, be) |>
+  collect() |>
+  drop_na() |>
+  mutate(month = floor_date(ymd(datadate), "month"))
+# lag variable
+me <- crsp_monthly |>
+  mutate(sorting_date = month %m+% months(1)) |>
+  select(permno, sorting_date, me = mktcap) |>
+  drop_na()
+# bm ratio
+bm <- book_equity |>
+  inner_join(crsp_monthly, by = c("gvkey", "month")) |>
+  mutate(
+    bm = be / mktcap,
+    sorting_date = month %m+% months(6),
+    comp_date = sorting_date
+  ) |>
+  select(permno, gvkey, sorting_date, comp_date, bm) |>
+  drop_na() |> 
+  filter(is.finite(bm)) 
+
+# merge above
+data_for_sorts <- crsp_monthly |>
+  left_join(bm, by = c("permno", "gvkey", "month" = "sorting_date")) |>
+  left_join(me, by = c("permno", "month" = "sorting_date")) |>
+  drop_na() |>  # Remove any remaining NAs
+  filter(
+    is.finite(me),
+    is.finite(bm),
+    me > 0,
+    !is.na(exchange)
+  )
+
+# sorts portfiolios
+create_portfolio <- function(data, 
+                           sorting_variable, 
+                           n_portfolios, 
+                           exchanges) {
+  breakpoints <- data |> 
+    filter(exchange %in% exchanges) |>
+    pull({{ sorting_variable }}) |>
+    quantile(
+      probs = seq(0, 1, length.out = n_portfolios + 1),
+      na.rm = TRUE,
+      names = FALSE
+    )
+
+  created_portfolios <- data |>
+    mutate(portfolio = findInterval( 
+      pick(everything()) |>
+        pull({{ sorting_variable }}),
+      breakpoints,
+      all.inside = TRUE 
+    )) |>
+    pull(portfolio)
+  
+  return(created_portfolios)
+}
+
+# create 25 portfolios
+value_portfolios <- data_for_sorts |>
+  group_by(month) |>
+  mutate(
+    portfolio_bm = create_portfolio(
+      data = pick(everything()),
+      sorting_variable = "bm",
+      n_portfolios = 5,
+      exchanges = c("NYSE")
+    ),
+    portfolio_me = create_portfolio(
+      data = pick(everything()),
+      sorting_variable = "me",
+      n_portfolios = 5,
+      exchanges = c("NYSE")
+    )) |>
+  group_by(month, portfolio_bm, portfolio_me) |>
+  summarize(
+    ret_excess = weighted.mean(ret_excess, mktcap),
+    .groups = "drop"
+  )
+
+# FF3 regressions
+portfolio_regressions <- value_portfolios |>
+  nest(data = c(month, ret_excess)) |>
+  mutate(
+    model = map(data, function(df) {
+      regression_data <- df |>
+        left_join(factors_ff3_monthly, by = "month")
+      lm(ret_excess ~ mkt_excess + smb + hml, data = regression_data)
+    }),
+    fit = map(model, glance)
+  ) |>
+  unnest(fit) |>
+  select(portfolio_bm, portfolio_me, r.squared, adj.r.squared)
+
+# summary
+summary_stats <- portfolio_regressions |>
+  summarize(
+    min_r2 = min(r.squared),
+    max_r2 = max(r.squared),
+    mean_r2 = mean(r.squared),
+    median_r2 = median(r.squared),
+    min_adj_r2 = min(adj.r.squared),
+    max_adj_r2 = max(adj.r.squared),
+    mean_adj_r2 = mean(adj.r.squared),
+    median_adj_r2 = median(adj.r.squared)
+  )
+
+# print("Summary Statistics for FF3 Regressions on 25 Size-BM Portfolios:")
+print(summary_stats)
+```
+
